@@ -22,61 +22,100 @@ def es_fecha(texto):
     return "/" in texto or "-" in texto or ":" in texto or "." in texto
 
 def extraer_apellidos(doc):
-    """Identifica con precisión los apellidos del titular en el documento"""
+    """Identifica con precisión los apellidos del titular usando bloques de texto válidos"""
     apellidos = set()
-    nombres_prohibidos = set()
+    nombres_a_salvar = set()
+    
+    etiquetas_nombre = [
+        "apellidos y nombres", "nombre / razón social", "nombre/razón social", 
+        "razón social / nombre", "sujeto evaluado", "titular", "persona evaluada"
+    ]
     
     for page in doc:
-        text = page.get_text("text")
-        
-        # 1. Buscar patrón con coma: 'APELLIDO1 APELLIDO2, NOMBRE1 NOMBRE2'
-        coincidencias_coma = re.findall(
-            r'([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})?)\s*,\s*([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})*)', 
-            text
-        )
-        for ap, nom in coincidencias_coma:
-            for w in ap.split():
-                if len(w) > 2 and w not in ["DEL", "LOS", "LAS", "SAN", "SANTA"]:
-                    apellidos.add(w.upper())
-            for w in nom.split():
-                nombres_prohibidos.add(w.upper())
-
-        # 2. Buscar por bloques y líneas cercanas a etiquetas de nombre
-        lines = page.get_text("lines")
-        for i, line in enumerate(lines):
-            line_str = "".join([span["text"] for span in line.get("spans", [])]).strip()
+        # Usamos 'blocks', que es 100% compatible con todas las versiones de PyMuPDF
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            if b[6] != 0:  # Ignorar bloques que no sean de texto
+                continue
+            texto_bloque = b[4]
+            lineas = [l.strip() for l in texto_bloque.splitlines() if l.strip()]
             
-            for etiqueta in ["Apellidos y Nombres", "Nombre / Razón Social", "Nombre/Razón Social", "Titular:"]:
-                if etiqueta.lower() in line_str.lower():
-                    # El valor puede estar en la misma línea o en la siguiente
-                    texto_a_revisar = line_str.replace(etiqueta, "").strip()
-                    if not texto_a_revisar and i + 1 < len(lines):
-                        texto_a_revisar = "".join([span["text"] for span in lines[i+1].get("spans", [])]).strip()
-                    
-                    partes = [p for p in re.split(r'[^A-ZÁÉÍÓÚÑa-z]+', texto_a_revisar) if len(p) > 2]
-                    if "," in texto_a_revisar:
-                        antes_coma = texto_a_revisar.split(",")[0]
-                        for w in re.split(r'[^A-ZÁÉÍÓÚÑa-z]+', antes_coma):
-                            if len(w) > 2:
-                                apellidos.add(w.upper())
-                    elif len(partes) >= 3:
-                        # Formato peruano común: Paterno Materno Nombres
-                        apellidos.add(partes[0].upper())
-                        apellidos.add(partes[1].upper())
-                        for nom in partes[2:]:
-                            nombres_prohibidos.add(nom.upper())
-                            
-    # Garantizar que ningún nombre de pila se marque por error como apellido
-    for n in nombres_prohibidos:
+            for idx, l in enumerate(lineas):
+                l_lower = l.lower()
+                
+                # Caso A: Si existen campos específicos de apellidos
+                if "apellido paterno" in l_lower:
+                    val = re.sub(r'(?i)apellido\s+paterno[\s:]*', '', l).strip()
+                    if not val and idx + 1 < len(lineas):
+                        val = lineas[idx+1].strip()
+                    for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', val):
+                        if len(w) > 2:
+                            apellidos.add(w.upper())
+                
+                if "apellido materno" in l_lower:
+                    val = re.sub(r'(?i)apellido\s+materno[\s:]*', '', l).strip()
+                    if not val and idx + 1 < len(lineas):
+                        val = lineas[idx+1].strip()
+                    for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', val):
+                        if len(w) > 2:
+                            apellidos.add(w.upper())
+
+                if "nombres" in l_lower and "apellidos" not in l_lower:
+                    val = re.sub(r'(?i)nombres?[\s:]*', '', l).strip()
+                    if not val and idx + 1 < len(lineas):
+                        val = lineas[idx+1].strip()
+                    for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', val):
+                        if len(w) > 2:
+                            nombres_a_salvar.add(w.upper())
+
+                # Caso B: Formato con coma (ej. GONZALES CARDENAS, ANTHONY PAOLO)
+                if "," in l and not any(c in l for c in ["/", "$", "S/.", "%"]):
+                    partes_coma = l.split(",")
+                    if len(partes_coma) == 2:
+                        antes = [w.upper() for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', partes_coma[0]) if len(w) > 2]
+                        despues = [w.upper() for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', partes_coma[1]) if len(w) > 2]
+                        if 1 <= len(antes) <= 3 and 1 <= len(despues) <= 3:
+                            for a in antes:
+                                apellidos.add(a)
+                            for d in despues:
+                                nombres_a_salvar.add(d)
+
+                # Caso C: Etiquetas combinadas (Apellidos y Nombres / Nombre / Razón Social)
+                for etiq in etiquetas_nombre:
+                    if etiq in l_lower:
+                        val = re.sub(rf'(?i){etiq}[\s:]*', '', l).strip()
+                        if not val and idx + 1 < len(lineas):
+                            val = lineas[idx+1].strip()
+                        
+                        palabras = [w.upper() for w in re.findall(r'[A-ZÁÉÍÓÚÑa-záéíóúñ]+', val) if len(w) > 2]
+                        palabras = [p for p in palabras if p not in ["DEL", "DE", "LA", "LOS", "SAN", "SANTA"]]
+                        
+                        if len(palabras) >= 4:
+                            # 2 apellidos + 2 nombres
+                            apellidos.add(palabras[0])
+                            apellidos.add(palabras[1])
+                            for n in palabras[2:]:
+                                nombres_a_salvar.add(n)
+                        elif len(palabras) == 3:
+                            # 2 apellidos + 1 nombre
+                            apellidos.add(palabras[0])
+                            apellidos.add(palabras[1])
+                            nombres_a_salvar.add(palabras[2])
+                        elif len(palabras) == 2:
+                            apellidos.add(palabras[0])
+                            nombres_a_salvar.add(palabras[1])
+
+    # Asegurar que ningún nombre de pila quede en la lista de apellidos
+    for n in nombres_a_salvar:
         if n in apellidos:
             apellidos.remove(n)
-            
+
     return apellidos
 
 def censurar_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    # Extraer apellidos del titular en todo el reporte
+    # Extraer los apellidos a pixelar
     apellidos_a_pixelar = extraer_apellidos(doc)
     
     for page in doc:
@@ -87,20 +126,20 @@ def censurar_pdf(pdf_bytes):
             texto_raw = w[4]
             palabra_limpia = re.sub(r'[^A-ZÁÉÍÓÚÑa-z0-9]', '', texto_raw)
             
-            # 1. Censurar SOLO APELLIDOS (Nombres se quedan visibles)
+            # 1. Pixelar SOLO APELLIDOS
             if palabra_limpia.upper() in apellidos_a_pixelar:
                 rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
                 continue
             
-            # Si contiene fecha o separadores, NO se censura
+            # Si contiene fecha o separadores, NO se toca
             if es_fecha(texto_raw):
                 continue
             
-            # 2. Censurar DNI (8 dígitos) y RUC (11 dígitos)
+            # 2. Pixelar DNI y RUC
             if PATRON_DNI.match(palabra_limpia) or PATRON_RUC.match(palabra_limpia):
                 rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
 
-        # 3. Censurar usuario consultante (ancho seguro de 130px sin tapar fechas adyacentes)
+        # 3. Pixelar usuario consultante (ancho seguro)
         for etiqueta in ETIQUETAS_USUARIO:
             matches = page.search_for(etiqueta)
             for rect in matches:
@@ -115,7 +154,6 @@ def censurar_pdf(pdf_bytes):
             
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
-            # Reducción drástica y ampliación sin suavizado (efecto mosaico)
             w_small = max(2, int(pix.width / 9))
             h_small = max(2, int(pix.height / 7))
             img_small = img.resize((w_small, h_small), resample=Image.Resampling.BILINEAR)
@@ -126,12 +164,12 @@ def censurar_pdf(pdf_bytes):
             img_bytes.seek(0)
             imagenes_pixeladas.append((rect, img_bytes.getvalue()))
 
-        # Borrar texto original con máscara limpia
+        # Borrado del texto subyacente con máscara blanca limpia
         for rect in rects_a_pixelar:
             page.add_redact_annot(rect, fill=(1, 1, 1))
         page.apply_redactions()
 
-        # Insertar imagen pixelada sobre el hueco
+        # Insertar imagen pixelada sobre el espacio
         for rect, img_data in imagenes_pixeladas:
             page.insert_image(rect, stream=img_data)
 
