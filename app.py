@@ -7,9 +7,8 @@ import streamlit as st
 st.set_page_config(page_title="Anonimizador de Reportes", page_icon="🔒", layout="centered")
 
 st.title("🔒 Limpiador de Reportes (Equifax / Experian)")
-st.write("Censura apellidos, DNI, RUC y usuario consultante con **efecto pixelado**, manteniendo nombres y fechas visibles.")
+st.write("Oculta **apellidos**, DNI, RUC y usuario consultante con **efecto pixelado**, manteniendo nombres y fechas visibles.")
 
-# Etiquetas del consultante
 ETIQUETAS_USUARIO = [
     "Usuario:", "Solicitado por:", "Consultado por:", "Cliente:", 
     "Razón Social Solicitante:", "Generado por:", "Entidad Solicitante:"
@@ -22,82 +21,101 @@ def es_fecha(texto):
     """Detecta si una palabra contiene formato de fecha o separadores"""
     return "/" in texto or "-" in texto or ":" in texto or "." in texto
 
+def extraer_apellidos(doc):
+    """Identifica con precisión los apellidos del titular en el documento"""
+    apellidos = set()
+    nombres_prohibidos = set()
+    
+    for page in doc:
+        text = page.get_text("text")
+        
+        # 1. Buscar patrón con coma: 'APELLIDO1 APELLIDO2, NOMBRE1 NOMBRE2'
+        coincidencias_coma = re.findall(
+            r'([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})?)\s*,\s*([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})*)', 
+            text
+        )
+        for ap, nom in coincidencias_coma:
+            for w in ap.split():
+                if len(w) > 2 and w not in ["DEL", "LOS", "LAS", "SAN", "SANTA"]:
+                    apellidos.add(w.upper())
+            for w in nom.split():
+                nombres_prohibidos.add(w.upper())
+
+        # 2. Buscar por bloques y líneas cercanas a etiquetas de nombre
+        lines = page.get_text("lines")
+        for i, line in enumerate(lines):
+            line_str = "".join([span["text"] for span in line.get("spans", [])]).strip()
+            
+            for etiqueta in ["Apellidos y Nombres", "Nombre / Razón Social", "Nombre/Razón Social", "Titular:"]:
+                if etiqueta.lower() in line_str.lower():
+                    # El valor puede estar en la misma línea o en la siguiente
+                    texto_a_revisar = line_str.replace(etiqueta, "").strip()
+                    if not texto_a_revisar and i + 1 < len(lines):
+                        texto_a_revisar = "".join([span["text"] for span in lines[i+1].get("spans", [])]).strip()
+                    
+                    partes = [p for p in re.split(r'[^A-ZÁÉÍÓÚÑa-z]+', texto_a_revisar) if len(p) > 2]
+                    if "," in texto_a_revisar:
+                        antes_coma = texto_a_revisar.split(",")[0]
+                        for w in re.split(r'[^A-ZÁÉÍÓÚÑa-z]+', antes_coma):
+                            if len(w) > 2:
+                                apellidos.add(w.upper())
+                    elif len(partes) >= 3:
+                        # Formato peruano común: Paterno Materno Nombres
+                        apellidos.add(partes[0].upper())
+                        apellidos.add(partes[1].upper())
+                        for nom in partes[2:]:
+                            nombres_prohibidos.add(nom.upper())
+                            
+    # Garantizar que ningún nombre de pila se marque por error como apellido
+    for n in nombres_prohibidos:
+        if n in apellidos:
+            apellidos.remove(n)
+            
+    return apellidos
+
 def censurar_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    # Extraer apellidos del titular en todo el reporte
+    apellidos_a_pixelar = extraer_apellidos(doc)
     
     for page in doc:
         rects_a_pixelar = []
         words = page.get_text("words")  # (x0, y0, x1, y1, "texto", block_no, line_no, word_no)
         
-        # 1. Censurar únicamente DNI y RUC (protegiendo fechas)
         for w in words:
             texto_raw = w[4]
-            # Si contiene separadores de fecha o hora, NO se toca
+            palabra_limpia = re.sub(r'[^A-ZÁÉÍÓÚÑa-z0-9]', '', texto_raw)
+            
+            # 1. Censurar SOLO APELLIDOS (Nombres se quedan visibles)
+            if palabra_limpia.upper() in apellidos_a_pixelar:
+                rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+                continue
+            
+            # Si contiene fecha o separadores, NO se censura
             if es_fecha(texto_raw):
                 continue
             
-            palabra = re.sub(r'[^\w]', '', texto_raw)
-            if PATRON_DNI.match(palabra) or PATRON_RUC.match(palabra):
+            # 2. Censurar DNI (8 dígitos) y RUC (11 dígitos)
+            if PATRON_DNI.match(palabra_limpia) or PATRON_RUC.match(palabra_limpia):
                 rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
 
-        # 2. Censurar usuario consultante (ancho moderado para no tapar fechas adyacentes)
+        # 3. Censurar usuario consultante (ancho seguro de 130px sin tapar fechas adyacentes)
         for etiqueta in ETIQUETAS_USUARIO:
             matches = page.search_for(etiqueta)
             for rect in matches:
-                # Solo tapamos el nombre del usuario (máximo 140px a la derecha), sin tocar fechas
-                rects_a_pixelar.append(fitz.Rect(rect.x0, rect.y0 - 1, rect.x1 + 140, rect.y1 + 1))
+                rects_a_pixelar.append(fitz.Rect(rect.x0, rect.y0 - 1, rect.x1 + 130, rect.y1 + 1))
 
-        # 3. Censurar SOLO APELLIDOS (Dejar Nombres visibles)
-        # En Perú el formato es: Paterno Materno Nombres
-        for etiqueta in ["Apellidos y Nombres:", "Nombre / Razón Social:", "Titular:"]:
-            matches = page.search_for(etiqueta)
-            for rect in matches:
-                # Buscamos las palabras que siguen en esa misma línea
-                palabras_linea = [
-                    w for w in words 
-                    if abs(w[1] - rect.y0) < 6 and w[0] > rect.x1
-                ]
-                palabras_linea.sort(key=lambda x: x[0])
-                
-                # Si hay coma (ej. PEREZ GARCIA, PEISER BELOMAR):
-                palabras_apellidos = []
-                tiene_coma = any("," in w[4] for w in palabras_linea)
-                
-                if tiene_coma:
-                    for w in palabras_linea:
-                        palabras_apellidos.append(w)
-                        if "," in w[4]:
-                            break
-                else:
-                    # Si no hay coma, tomamos solo los primeros 2 términos (Apellidos)
-                    palabras_apellidos = palabras_linea[:2]
-                
-                for w in palabras_apellidos:
-                    rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
-
-        # Si el reporte tiene campos separados específicos de apellidos:
-        for etiq_ap in ["Apellido Paterno:", "Apellido Materno:"]:
-            matches = page.search_for(etiq_ap)
-            for rect in matches:
-                palabras_valor = [
-                    w for w in words 
-                    if abs(w[1] - rect.y0) < 6 and w[0] > rect.x1
-                ]
-                if palabras_valor:
-                    w = palabras_valor[0]
-                    rects_a_pixelar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
-
-        # 4. APLICAR EFECTO PIXELEADO REAL
+        # 4. APLICAR EFECTO PIXELEADO / MOSAICO
         imagenes_pixeladas = []
         for rect in rects_a_pixelar:
-            # Capturar recorte de la zona
             pix = page.get_pixmap(clip=rect, dpi=150)
             if pix.width < 4 or pix.height < 4:
                 continue
             
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
-            # Efecto pixelado / mosaico
+            # Reducción drástica y ampliación sin suavizado (efecto mosaico)
             w_small = max(2, int(pix.width / 9))
             h_small = max(2, int(pix.height / 7))
             img_small = img.resize((w_small, h_small), resample=Image.Resampling.BILINEAR)
@@ -108,11 +126,12 @@ def censurar_pdf(pdf_bytes):
             img_bytes.seek(0)
             imagenes_pixeladas.append((rect, img_bytes.getvalue()))
 
-        # Borrado de texto interno (seguridad) y reemplazo por imagen pixelada
+        # Borrar texto original con máscara limpia
         for rect in rects_a_pixelar:
-            page.add_redact_annot(rect, fill=(1, 1, 1))  # Fondo blanco limpio
+            page.add_redact_annot(rect, fill=(1, 1, 1))
         page.apply_redactions()
 
+        # Insertar imagen pixelada sobre el hueco
         for rect, img_data in imagenes_pixeladas:
             page.insert_image(rect, stream=img_data)
 
@@ -128,7 +147,7 @@ if uploaded_file is not None:
     st.info(f"Reporte cargado: **{uploaded_file.name}**")
     
     if st.button("🚀 Ocultar Datos Sensibles"):
-        with st.spinner("Aplicando efecto pixelado a datos sensibles..."):
+        with st.spinner("Pixelando apellidos, DNI y usuario..."):
             pdf_limpio = censurar_pdf(uploaded_file.read())
             st.success("¡Documento procesado con éxito!")
             
