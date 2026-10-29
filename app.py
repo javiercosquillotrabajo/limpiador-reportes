@@ -8,38 +8,45 @@ st.set_page_config(page_title="Anonimizador de Reportes", page_icon="🔒", layo
 st.title("🔒 Limpiador de Reportes (Equifax / Experian)")
 st.write("Sube el PDF de Infocorp o Sentinel para ocultar datos personales.")
 
+# Etiquetas comunes en reportes peruanos
 ETIQUETAS_USUARIO = [
     "Usuario:", "Solicitado por:", "Consultado por:", "Cliente:", 
-    "Razón Social Solicitante:", "Generado por:"
+    "Razón Social Solicitante:", "Generado por:", "Entidad Solicitante:"
 ]
+
+ETIQUETAS_NOMBRE = [
+    "Apellidos y Nombres:", "Nombre / Razón Social:", "Titular:", "Nombre:", "Razón Social:"
+]
+
+PATRON_DNI = re.compile(r'^\d{8}$')
+PATRON_RUC = re.compile(r'^(10|20|15|17)\d{9}$')
 
 def censurar_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    regex_dni = r'\b\d{8}\b'
-    regex_ruc = r'\b(10|20|15|17)\d{9}\b'
     
     for page in doc:
         rects_a_censurar = []
         
-        # Censurar DNI y RUC
-        for patron in [regex_dni, regex_ruc]:
-            matches = page.search_for(patron, regex=True)
-            for rect in matches:
-                rects_a_censurar.append(rect)
-                
-        # Censurar datos del solicitante/usuario
+        # 1. Detección de DNI y RUC
+        words = page.get_text("words")
+        for w in words:
+            palabra_limpia = re.sub(r'[^\w]', '', w[4])
+            if PATRON_DNI.match(palabra_limpia) or PATRON_RUC.match(palabra_limpia):
+                rects_a_censurar.append(fitz.Rect(w[0], w[1], w[2], w[3]))
+
+        # 2. Censurar usuario/solicitante
         for etiqueta in ETIQUETAS_USUARIO:
             matches = page.search_for(etiqueta)
             for rect in matches:
-                rects_a_censurar.append(fitz.Rect(rect.x0, rect.y0 - 2, rect.x1 + 250, rect.y1 + 2))
+                rects_a_censurar.append(fitz.Rect(rect.x0, rect.y0 - 2, rect.x1 + 300, rect.y1 + 2))
 
-        # Censurar nombres
-        for etiqueta in ["Apellidos y Nombres:", "Nombre / Razón Social:", "Titular:"]:
+        # 3. Censurar nombres
+        for etiqueta in ETIQUETAS_NOMBRE:
             matches = page.search_for(etiqueta)
             for rect in matches:
-                rects_a_censurar.append(fitz.Rect(rect.x1 + 5, rect.y0 - 2, rect.x1 + 350, rect.y1 + 2))
+                rects_a_censurar.append(fitz.Rect(rect.x1 + 4, rect.y0 - 2, rect.x1 + 350, rect.y1 + 2))
 
-        # Aplicar censura física irreversible
+        # 4. Censura física irreversible
         for rect in rects_a_censurar:
             page.add_redact_annot(rect, fill=(0, 0, 0))
             
